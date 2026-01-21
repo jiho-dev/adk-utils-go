@@ -36,7 +36,7 @@ go get github.com/achetronic/adk-utils-go
 Works with OpenAI API and any OpenAI-compatible API (Ollama, OpenRouter, Azure OpenAI, etc.):
 
 ```go
-import genaiopenai "adk-utils-go/genai/openai"
+import genaiopenai "github.com/achetronic/adk-utils-go/genai/openai"
 
 // Create client
 llmModel := genaiopenai.New(genaiopenai.Config{
@@ -58,7 +58,7 @@ agent, _ := llmagent.New(llmagent.Config{
 Native Anthropic Claude support:
 
 ```go
-import genaianthropic "adk-utils-go/genai/anthropic"
+import genaianthropic "github.com/achetronic/adk-utils-go/genai/anthropic"
 
 llmModel := genaianthropic.New(genaianthropic.Config{
     APIKey:    os.Getenv("ANTHROPIC_API_KEY"),
@@ -87,7 +87,7 @@ Both clients support:
 Persistent session storage with Redis:
 
 ```go
-import sessionredis "adk-utils-go/session/redis"
+import sessionredis "github.com/achetronic/adk-utils-go/session/redis"
 
 sessionService, _ := sessionredis.NewRedisSessionService(sessionredis.RedisSessionServiceConfig{
     Addr:     "localhost:6379",
@@ -109,7 +109,7 @@ runner, _ := runner.New(runner.Config{
 Long-term memory with semantic search:
 
 ```go
-import memorypostgres "adk-utils-go/memory/postgres"
+import memorypostgres "github.com/achetronic/adk-utils-go/memory/postgres"
 
 memoryService, _ := memorypostgres.NewPostgresMemoryService(ctx, memorypostgres.PostgresMemoryServiceConfig{
     ConnString: "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable",
@@ -132,7 +132,7 @@ runner, _ := runner.New(runner.Config{
 Give agents explicit control over long-term memory:
 
 ```go
-import memorytools "adk-utils-go/tools/memory"
+import memorytools "github.com/achetronic/adk-utils-go/tools/memory"
 
 memoryToolset, _ := memorytools.NewToolset(memorytools.ToolsetConfig{
     MemoryService: memoryService,

@@ -41,7 +41,7 @@ import (
 	"log"
 	"os"
 	"time"
-	
+
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/agent/llmagent"
 	"google.golang.org/adk/memory"
@@ -50,10 +50,10 @@ import (
 	"google.golang.org/adk/tool"
 	"google.golang.org/genai"
 
-	genaiopenai "adk-utils-go/genai/openai"
-	memorypostgres "adk-utils-go/memory/postgres"
-	sessionredis "adk-utils-go/session/redis"
-	memorytools "adk-utils-go/tools/memory"
+	genaiopenai "github.com/achetronic/adk-utils-go/genai/openai"
+	memorypostgres "github.com/achetronic/adk-utils-go/memory/postgres"
+	sessionredis "github.com/achetronic/adk-utils-go/session/redis"
+	memorytools "github.com/achetronic/adk-utils-go/tools/memory"
 )
 
 const (

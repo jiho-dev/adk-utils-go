@@ -34,7 +34,7 @@ import (
 	"google.golang.org/adk/session"
 	"google.golang.org/genai"
 
-	genaianthropic "adk-utils-go/genai/anthropic"
+	genaianthropic "github.com/achetronic/adk-utils-go/genai/anthropic"
 )
 
 func main() {

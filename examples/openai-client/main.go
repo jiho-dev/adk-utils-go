@@ -39,7 +39,7 @@ import (
 	"google.golang.org/adk/session"
 	"google.golang.org/genai"
 
-	genaiopenai "adk-utils-go/genai/openai"
+	genaiopenai "github.com/achetronic/adk-utils-go/genai/openai"
 )
 
 func main() {

@@ -42,9 +42,9 @@ import (
 	"google.golang.org/adk/tool"
 	"google.golang.org/genai"
 
-	genaiopenai "adk-utils-go/genai/openai"
-	memorypostgres "adk-utils-go/memory/postgres"
-	memorytools "adk-utils-go/tools/memory"
+	genaiopenai "github.com/achetronic/adk-utils-go/genai/openai"
+	memorypostgres "github.com/achetronic/adk-utils-go/memory/postgres"
+	memorytools "github.com/achetronic/adk-utils-go/tools/memory"
 )
 
 const (

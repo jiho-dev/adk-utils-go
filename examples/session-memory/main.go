@@ -43,8 +43,8 @@ import (
 	"google.golang.org/adk/tool"
 	"google.golang.org/genai"
 
-	genaiopenai "adk-utils-go/genai/openai"
-	sessionredis "adk-utils-go/session/redis"
+	genaiopenai "github.com/achetronic/adk-utils-go/genai/openai"
+	sessionredis "github.com/achetronic/adk-utils-go/session/redis"
 )
 
 const (

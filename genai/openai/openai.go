@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package openai provides an OpenAI-compatible LLM implementation for the ADK.
+// It supports both native OpenAI API and compatible providers like Ollama.
 package openai
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
+	"sync"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -35,26 +41,35 @@ var (
 	ErrNoChoicesInResponse = errors.New("no choices in OpenAI response")
 )
 
+// OpenAI enforces a 40-character limit on tool_call_id fields.
+const maxToolCallIDLength = 40
+
 // Model implements model.LLM using the official OpenAI Go SDK.
+// Works with OpenAI API and compatible providers (Ollama, vLLM, etc.).
 type Model struct {
 	client    *openai.Client
 	modelName string
+
+	// toolCallIDMap stores original IDs when they exceed OpenAI's limit.
+	// Keys are shortened hashes, values are original IDs.
+	toolCallIDMap   map[string]string
+	toolCallIDMapMu sync.RWMutex
 }
 
-// Config holds configuration for creating a new Model.
+// Config holds the configuration for creating an OpenAI Model.
 type Config struct {
-	// APIKey is the OpenAI API key. If empty, uses OPENAI_API_KEY env var.
+	// APIKey for authentication. Falls back to OPENAI_API_KEY env var if empty.
 	APIKey string
-	// BaseURL is the API base URL. Use this for OpenAI-compatible APIs like Ollama.
-	// Example: "http://localhost:11434/v1"
+	// BaseURL for the API endpoint. Use for OpenAI-compatible providers.
+	// Example: "http://localhost:11434/v1" for Ollama.
 	BaseURL string
-	// ModelName is the model to use (e.g., "gpt-4o", "qwen3:8b").
+	// ModelName specifies which model to use (e.g., "gpt-4o", "qwen3:8b").
 	ModelName string
 }
 
-// New creates a new Model with the given configuration.
+// New creates a new OpenAI Model with the given configuration.
 func New(cfg Config) *Model {
-	opts := []option.RequestOption{}
+	var opts []option.RequestOption
 
 	if cfg.APIKey != "" {
 		opts = append(opts, option.WithAPIKey(cfg.APIKey))
@@ -66,17 +81,19 @@ func New(cfg Config) *Model {
 	client := openai.NewClient(opts...)
 
 	return &Model{
-		client:    &client,
-		modelName: cfg.ModelName,
+		client:        &client,
+		modelName:     cfg.ModelName,
+		toolCallIDMap: make(map[string]string),
 	}
 }
 
-// Name implements model.LLM.
+// Name returns the model name.
 func (m *Model) Name() string {
 	return m.modelName
 }
 
-// GenerateContent implements model.LLM.
+// GenerateContent sends a request to the LLM and returns responses.
+// Set stream=true for streaming responses, false for a single response.
 func (m *Model) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
 	if stream {
 		return m.generateStream(ctx, req)
@@ -84,6 +101,7 @@ func (m *Model) GenerateContent(ctx context.Context, req *model.LLMRequest, stre
 	return m.generate(ctx, req)
 }
 
+// generate sends a non-streaming request and yields a single response.
 func (m *Model) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
 		params, err := m.buildChatCompletionParams(req)
@@ -108,6 +126,8 @@ func (m *Model) generate(ctx context.Context, req *model.LLMRequest) iter.Seq2[*
 	}
 }
 
+// generateStream sends a streaming request and yields partial responses
+// as they arrive, followed by a final aggregated response.
 func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.Seq2[*model.LLMResponse, error] {
 	return func(yield func(*model.LLMResponse, error) bool) {
 		params, err := m.buildChatCompletionParams(req)
@@ -117,18 +137,19 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 		}
 
 		stream := m.client.Chat.Completions.NewStreaming(ctx, params)
-
 		acc := openai.ChatCompletionAccumulator{}
 
+		// Yield partial responses as chunks arrive
 		for stream.Next() {
 			chunk := stream.Current()
 			acc.AddChunk(chunk)
 
-			// Yield partial text content
 			if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-				part := &genai.Part{Text: chunk.Choices[0].Delta.Content}
 				llmResp := &model.LLMResponse{
-					Content:      &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{part}},
+					Content: &genai.Content{
+						Role:  genai.RoleModel,
+						Parts: []*genai.Part{{Text: chunk.Choices[0].Delta.Content}},
+					},
 					Partial:      true,
 					TurnComplete: false,
 				}
@@ -143,69 +164,62 @@ func (m *Model) generateStream(ctx context.Context, req *model.LLMRequest) iter.
 			return
 		}
 
-		// Build final aggregated response
-		finalContent := &genai.Content{
-			Role:  genai.RoleModel,
-			Parts: []*genai.Part{},
-		}
-
-		if len(acc.Choices) > 0 {
-			choice := acc.Choices[0]
-
-			// Add text content
-			if choice.Message.Content != "" {
-				finalContent.Parts = append(finalContent.Parts, &genai.Part{Text: choice.Message.Content})
-			}
-
-			// Add tool calls
-			for _, toolCall := range choice.Message.ToolCalls {
-				finalContent.Parts = append(finalContent.Parts, &genai.Part{
-					FunctionCall: &genai.FunctionCall{
-						ID:   toolCall.ID,
-						Name: toolCall.Function.Name,
-						Args: parseJSONArgs(toolCall.Function.Arguments),
-					},
-				})
-			}
-		}
-
-		var usageMetadata *genai.GenerateContentResponseUsageMetadata
-		if acc.Usage.TotalTokens > 0 {
-			usageMetadata = &genai.GenerateContentResponseUsageMetadata{
-				PromptTokenCount:     int32(acc.Usage.PromptTokens),
-				CandidatesTokenCount: int32(acc.Usage.CompletionTokens),
-				TotalTokenCount:      int32(acc.Usage.TotalTokens),
-			}
-		}
-
-		var finishReason genai.FinishReason
-		if len(acc.Choices) > 0 {
-			finishReason = convertFinishReason(string(acc.Choices[0].FinishReason))
-		}
-
-		finalResp := &model.LLMResponse{
-			Content:       finalContent,
-			UsageMetadata: usageMetadata,
-			FinishReason:  finishReason,
-			Partial:       false,
-			TurnComplete:  true,
-		}
-		yield(finalResp, nil)
+		// Build and yield final aggregated response
+		yield(m.buildStreamFinalResponse(&acc), nil)
 	}
 }
 
-func (m *Model) buildChatCompletionParams(req *model.LLMRequest) (openai.ChatCompletionNewParams, error) {
-	messages := []openai.ChatCompletionMessageParamUnion{}
+// buildStreamFinalResponse creates the final LLMResponse from accumulated stream data.
+func (m *Model) buildStreamFinalResponse(acc *openai.ChatCompletionAccumulator) *model.LLMResponse {
+	content := &genai.Content{
+		Role:  genai.RoleModel,
+		Parts: []*genai.Part{},
+	}
 
-	// Add system instruction if present
-	if req.Config != nil && req.Config.SystemInstruction != nil {
-		systemText := extractTextFromContent(req.Config.SystemInstruction)
-		if systemText != "" {
-			messages = append(messages, openai.SystemMessage(systemText))
+	if len(acc.Choices) > 0 {
+		choice := acc.Choices[0]
+
+		if choice.Message.Content != "" {
+			content.Parts = append(content.Parts, &genai.Part{Text: choice.Message.Content})
+		}
+
+		for _, tc := range choice.Message.ToolCalls {
+			content.Parts = append(content.Parts, &genai.Part{
+				FunctionCall: &genai.FunctionCall{
+					ID:   tc.ID,
+					Name: tc.Function.Name,
+					Args: parseJSONArgs(tc.Function.Arguments),
+				},
+			})
 		}
 	}
 
-	// Convert content messages
+	var finishReason genai.FinishReason
+	if len(acc.Choices) > 0 {
+		finishReason = convertFinishReason(string(acc.Choices[0].FinishReason))
+	}
+
+	return &model.LLMResponse{
+		Content:       content,
+		UsageMetadata: convertUsageMetadata(acc.Usage),
+		FinishReason:  finishReason,
+		Partial:       false,
+		TurnComplete:  true,
+	}
+}
+
+// buildChatCompletionParams converts an LLMRequest into OpenAI API parameters.
+func (m *Model) buildChatCompletionParams(req *model.LLMRequest) (openai.ChatCompletionNewParams, error) {
+	var messages []openai.ChatCompletionMessageParamUnion
+
+	// Add system instruction
+	if req.Config != nil && req.Config.SystemInstruction != nil {
+		if text := extractText(req.Config.SystemInstruction); text != "" {
+			messages = append(messages, openai.SystemMessage(text))
+		}
+	}
+
+	// Convert conversation messages
 	for _, content := range req.Contents {
 		msgs, err := m.convertContentToMessages(content)
 		if err != nil {
@@ -219,188 +233,190 @@ func (m *Model) buildChatCompletionParams(req *model.LLMRequest) (openai.ChatCom
 		Messages: messages,
 	}
 
-	// Apply config settings
+	// Apply optional configuration
 	if req.Config != nil {
-		if req.Config.Temperature != nil {
-			params.Temperature = openai.Float(float64(*req.Config.Temperature))
-		}
-		if req.Config.MaxOutputTokens > 0 {
-			params.MaxTokens = openai.Int(int64(req.Config.MaxOutputTokens))
-		}
-		if req.Config.TopP != nil {
-			params.TopP = openai.Float(float64(*req.Config.TopP))
-		}
-		if len(req.Config.StopSequences) > 0 {
-			if len(req.Config.StopSequences) == 1 {
-				params.Stop = openai.ChatCompletionNewParamsStopUnion{
-					OfString: openai.String(req.Config.StopSequences[0]),
-				}
-			} else {
-				params.Stop = openai.ChatCompletionNewParamsStopUnion{
-					OfStringArray: req.Config.StopSequences,
-				}
-			}
-		}
+		m.applyGenerationConfig(&params, req.Config)
+	}
 
-		// Handle ThinkingConfig (ReasoningEffort for o-series models)
-		if req.Config.ThinkingConfig != nil {
-			switch req.Config.ThinkingConfig.ThinkingLevel {
-			case genai.ThinkingLevelLow:
-				params.ReasoningEffort = shared.ReasoningEffortLow
-			case genai.ThinkingLevelHigh:
-				params.ReasoningEffort = shared.ReasoningEffortHigh
-			default:
-				params.ReasoningEffort = shared.ReasoningEffortMedium
-			}
-		}
+	return params, nil
+}
 
-		// Handle JSON mode
-		if req.Config.ResponseMIMEType == "application/json" {
-			params.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
-				OfJSONObject: &openai.ResponseFormatJSONObjectParam{},
-			}
-		}
+// applyGenerationConfig applies optional generation settings to the request params.
+func (m *Model) applyGenerationConfig(params *openai.ChatCompletionNewParams, cfg *genai.GenerateContentConfig) {
+	if cfg.Temperature != nil {
+		params.Temperature = openai.Float(float64(*cfg.Temperature))
+	}
+	if cfg.MaxOutputTokens > 0 {
+		params.MaxTokens = openai.Int(int64(cfg.MaxOutputTokens))
+	}
+	if cfg.TopP != nil {
+		params.TopP = openai.Float(float64(*cfg.TopP))
+	}
 
-		// Handle response schema
-		if req.Config.ResponseSchema != nil {
-			schemaMap, err := convertSchema(req.Config.ResponseSchema)
-			if err != nil {
-				return openai.ChatCompletionNewParams{}, err
-			}
+	// Stop sequences
+	if len(cfg.StopSequences) == 1 {
+		params.Stop = openai.ChatCompletionNewParamsStopUnion{
+			OfString: openai.String(cfg.StopSequences[0]),
+		}
+	} else if len(cfg.StopSequences) > 1 {
+		params.Stop = openai.ChatCompletionNewParamsStopUnion{
+			OfStringArray: cfg.StopSequences,
+		}
+	}
+
+	// Reasoning effort (for o-series models)
+	if cfg.ThinkingConfig != nil {
+		params.ReasoningEffort = convertThinkingLevel(cfg.ThinkingConfig.ThinkingLevel)
+	}
+
+	// JSON mode
+	if cfg.ResponseMIMEType == "application/json" {
+		params.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
+			OfJSONObject: &openai.ResponseFormatJSONObjectParam{},
+		}
+	}
+
+	// Structured output with schema
+	if cfg.ResponseSchema != nil {
+		if schemaMap, err := convertSchema(cfg.ResponseSchema); err == nil {
 			params.ResponseFormat = openai.ChatCompletionNewParamsResponseFormatUnion{
 				OfJSONSchema: &openai.ResponseFormatJSONSchemaParam{
 					JSONSchema: openai.ResponseFormatJSONSchemaJSONSchemaParam{
 						Name:        "response",
-						Description: openai.String(req.Config.ResponseSchema.Description),
+						Description: openai.String(cfg.ResponseSchema.Description),
 						Schema:      schemaMap,
 						Strict:      openai.Bool(true),
 					},
 				},
 			}
 		}
+	}
 
-		// Convert tools
-		if len(req.Config.Tools) > 0 {
-			tools, err := m.convertTools(req.Config.Tools)
-			if err != nil {
-				return openai.ChatCompletionNewParams{}, err
-			}
+	// Tools
+	if len(cfg.Tools) > 0 {
+		if tools, err := m.convertTools(cfg.Tools); err == nil {
 			params.Tools = tools
 		}
 	}
-
-	return params, nil
 }
 
+// convertContentToMessages converts a genai.Content into OpenAI message format.
+// Handles text, images, function calls, and function responses.
 func (m *Model) convertContentToMessages(content *genai.Content) ([]openai.ChatCompletionMessageParamUnion, error) {
 	var messages []openai.ChatCompletionMessageParamUnion
-
-	// Handle function responses first (they become tool messages)
-	for _, part := range content.Parts {
-		if part.FunctionResponse != nil {
-			responseJSON, err := json.Marshal(part.FunctionResponse.Response)
-			if err != nil {
-				return nil, fmt.Errorf("failed to marshal function response: %w", err)
-			}
-			messages = append(messages, openai.ToolMessage(part.FunctionResponse.ID, string(responseJSON)))
-		}
-	}
-
-	// Collect non-function-response parts
 	var textParts []string
 	var toolCalls []openai.ChatCompletionMessageToolCallUnionParam
 	var imageParts []openai.ChatCompletionContentPartImageParam
 
 	for _, part := range content.Parts {
-		if part.FunctionResponse != nil {
-			continue // Already handled
-		}
+		switch {
+		case part.FunctionResponse != nil:
+			// Tool responses become separate messages
+			responseJSON, err := json.Marshal(part.FunctionResponse.Response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal function response: %w", err)
+			}
+			normalizedID := m.normalizeToolCallID(part.FunctionResponse.ID)
+			messages = append(messages, openai.ToolMessage(string(responseJSON), normalizedID))
 
-		if part.Text != "" {
-			textParts = append(textParts, part.Text)
-		}
-
-		if part.FunctionCall != nil {
+		case part.FunctionCall != nil:
+			// Collect tool calls for assistant message
 			argsJSON, err := json.Marshal(part.FunctionCall.Args)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal function args: %w", err)
 			}
+			normalizedID := m.normalizeToolCallID(part.FunctionCall.ID)
 			toolCalls = append(toolCalls, openai.ChatCompletionMessageToolCallUnionParam{
 				OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
-					ID: part.FunctionCall.ID,
+					ID: normalizedID,
 					Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
 						Name:      part.FunctionCall.Name,
 						Arguments: string(argsJSON),
 					},
 				},
 			})
-		}
 
-		if part.InlineData != nil {
-			switch part.InlineData.MIMEType {
-			case "image/jpg", "image/jpeg", "image/png", "image/gif", "image/webp":
-				base64Data := base64.StdEncoding.EncodeToString(part.InlineData.Data)
-				dataURL := fmt.Sprintf("data:%s;base64,%s", part.InlineData.MIMEType, base64Data)
-				imageParts = append(imageParts, openai.ChatCompletionContentPartImageParam{
-					ImageURL: openai.ChatCompletionContentPartImageImageURLParam{
-						URL:    dataURL,
-						Detail: "auto",
-					},
-				})
+		case part.Text != "":
+			textParts = append(textParts, part.Text)
+
+		case part.InlineData != nil:
+			if img := convertInlineDataToImage(part.InlineData); img != nil {
+				imageParts = append(imageParts, *img)
 			}
 		}
 	}
 
-	// Build the message based on role and content
+	// Build role-specific message if there's content
 	if len(textParts) > 0 || len(imageParts) > 0 || len(toolCalls) > 0 {
-		role := convertRoleToOpenAI(content.Role)
-
-		switch role {
-		case "user":
-			if len(imageParts) > 0 {
-				// Multi-part message with images
-				var parts []openai.ChatCompletionContentPartUnionParam
-				for _, text := range textParts {
-					parts = append(parts, openai.ChatCompletionContentPartUnionParam{
-						OfText: &openai.ChatCompletionContentPartTextParam{Text: text},
-					})
-				}
-				for _, img := range imageParts {
-					parts = append(parts, openai.ChatCompletionContentPartUnionParam{
-						OfImageURL: &img,
-					})
-				}
-				messages = append(messages, openai.ChatCompletionMessageParamUnion{
-					OfUser: &openai.ChatCompletionUserMessageParam{
-						Content: openai.ChatCompletionUserMessageParamContentUnion{
-							OfArrayOfContentParts: parts,
-						},
-					},
-				})
-			} else {
-				messages = append(messages, openai.UserMessage(joinTexts(textParts)))
-			}
-
-		case "assistant":
-			msg := openai.ChatCompletionAssistantMessageParam{}
-			if len(textParts) > 0 {
-				msg.Content = openai.ChatCompletionAssistantMessageParamContentUnion{
-					OfString: openai.String(joinTexts(textParts)),
-				}
-			}
-			if len(toolCalls) > 0 {
-				msg.ToolCalls = toolCalls
-			}
-			messages = append(messages, openai.ChatCompletionMessageParamUnion{OfAssistant: &msg})
-
-		case "system":
-			messages = append(messages, openai.SystemMessage(joinTexts(textParts)))
+		msg := m.buildRoleMessage(content.Role, textParts, imageParts, toolCalls)
+		if msg != nil {
+			messages = append(messages, *msg)
 		}
 	}
 
 	return messages, nil
 }
 
+// buildRoleMessage creates the appropriate message type based on role.
+func (m *Model) buildRoleMessage(role string, texts []string, images []openai.ChatCompletionContentPartImageParam, toolCalls []openai.ChatCompletionMessageToolCallUnionParam) *openai.ChatCompletionMessageParamUnion {
+	switch convertRole(role) {
+	case "user":
+		return buildUserMessage(texts, images)
+	case "assistant":
+		return buildAssistantMessage(texts, toolCalls)
+	case "system":
+		msg := openai.SystemMessage(joinTexts(texts))
+		return &msg
+	}
+	return nil
+}
+
+// buildUserMessage creates a user message, with multi-part support for images.
+func buildUserMessage(texts []string, images []openai.ChatCompletionContentPartImageParam) *openai.ChatCompletionMessageParamUnion {
+	if len(images) == 0 {
+		msg := openai.UserMessage(joinTexts(texts))
+		return &msg
+	}
+
+	// Multi-part message with images
+	var parts []openai.ChatCompletionContentPartUnionParam
+	for _, text := range texts {
+		parts = append(parts, openai.ChatCompletionContentPartUnionParam{
+			OfText: &openai.ChatCompletionContentPartTextParam{Text: text},
+		})
+	}
+	for _, img := range images {
+		parts = append(parts, openai.ChatCompletionContentPartUnionParam{
+			OfImageURL: &img,
+		})
+	}
+
+	return &openai.ChatCompletionMessageParamUnion{
+		OfUser: &openai.ChatCompletionUserMessageParam{
+			Content: openai.ChatCompletionUserMessageParamContentUnion{
+				OfArrayOfContentParts: parts,
+			},
+		},
+	}
+}
+
+// buildAssistantMessage creates an assistant message with optional tool calls.
+func buildAssistantMessage(texts []string, toolCalls []openai.ChatCompletionMessageToolCallUnionParam) *openai.ChatCompletionMessageParamUnion {
+	msg := openai.ChatCompletionAssistantMessageParam{}
+
+	if len(texts) > 0 {
+		msg.Content = openai.ChatCompletionAssistantMessageParamContentUnion{
+			OfString: openai.String(joinTexts(texts)),
+		}
+	}
+	if len(toolCalls) > 0 {
+		msg.ToolCalls = toolCalls
+	}
+
+	return &openai.ChatCompletionMessageParamUnion{OfAssistant: &msg}
+}
+
+// convertResponse transforms an OpenAI response into an LLMResponse.
 func (m *Model) convertResponse(resp *openai.ChatCompletion) (*model.LLMResponse, error) {
 	if len(resp.Choices) == 0 {
 		return nil, ErrNoChoicesInResponse
@@ -412,40 +428,29 @@ func (m *Model) convertResponse(resp *openai.ChatCompletion) (*model.LLMResponse
 		Parts: []*genai.Part{},
 	}
 
-	// Convert message content
 	if choice.Message.Content != "" {
 		content.Parts = append(content.Parts, &genai.Part{Text: choice.Message.Content})
 	}
 
-	// Convert tool calls
-	for _, toolCall := range choice.Message.ToolCalls {
+	for _, tc := range choice.Message.ToolCalls {
 		content.Parts = append(content.Parts, &genai.Part{
 			FunctionCall: &genai.FunctionCall{
-				ID:   toolCall.ID,
-				Name: toolCall.Function.Name,
-				Args: parseJSONArgs(toolCall.Function.Arguments),
+				ID:   tc.ID,
+				Name: tc.Function.Name,
+				Args: parseJSONArgs(tc.Function.Arguments),
 			},
 		})
 	}
 
-	// Convert usage metadata
-	var usageMetadata *genai.GenerateContentResponseUsageMetadata
-	if resp.Usage.TotalTokens > 0 {
-		usageMetadata = &genai.GenerateContentResponseUsageMetadata{
-			PromptTokenCount:     int32(resp.Usage.PromptTokens),
-			CandidatesTokenCount: int32(resp.Usage.CompletionTokens),
-			TotalTokenCount:      int32(resp.Usage.TotalTokens),
-		}
-	}
-
 	return &model.LLMResponse{
 		Content:       content,
-		UsageMetadata: usageMetadata,
+		UsageMetadata: convertUsageMetadata(resp.Usage),
 		FinishReason:  convertFinishReason(string(choice.FinishReason)),
 		TurnComplete:  true,
 	}, nil
 }
 
+// convertTools transforms genai tools into OpenAI function tool format.
 func (m *Model) convertTools(genaiTools []*genai.Tool) ([]openai.ChatCompletionToolUnionParam, error) {
 	var tools []openai.ChatCompletionToolUnionParam
 
@@ -454,35 +459,16 @@ func (m *Model) convertTools(genaiTools []*genai.Tool) ([]openai.ChatCompletionT
 			continue
 		}
 
-		// Only function declarations are supported
 		for _, funcDecl := range genaiTool.FunctionDeclarations {
 			params := funcDecl.ParametersJsonSchema
 			if params == nil {
 				params = funcDecl.Parameters
 			}
 
-			var funcParams shared.FunctionParameters
-			if params != nil {
-				// Try direct map[string]any first
-				if m, ok := params.(map[string]any); ok {
-					funcParams = shared.FunctionParameters(m)
-				} else {
-					// Handle other types (e.g., *jsonschema.Schema from ADK functiontool)
-					// by converting via JSON serialization
-					jsonBytes, err := json.Marshal(params)
-					if err == nil {
-						var m map[string]any
-						if json.Unmarshal(jsonBytes, &m) == nil {
-							funcParams = shared.FunctionParameters(m)
-						}
-					}
-				}
-			}
-
 			tools = append(tools, openai.ChatCompletionFunctionTool(shared.FunctionDefinitionParam{
 				Name:        funcDecl.Name,
 				Description: openai.String(funcDecl.Description),
-				Parameters:  funcParams,
+				Parameters:  convertToFunctionParams(params),
 			}))
 		}
 	}
@@ -490,38 +476,62 @@ func (m *Model) convertTools(genaiTools []*genai.Tool) ([]openai.ChatCompletionT
 	return tools, nil
 }
 
+// convertToFunctionParams converts various parameter types to OpenAI format.
+func convertToFunctionParams(params any) shared.FunctionParameters {
+	if params == nil {
+		return nil
+	}
+
+	// Direct map
+	if m, ok := params.(map[string]any); ok {
+		return shared.FunctionParameters(m)
+	}
+
+	// Convert via JSON for other types (e.g., *jsonschema.Schema)
+	jsonBytes, err := json.Marshal(params)
+	if err != nil {
+		return nil
+	}
+
+	var m map[string]any
+	if json.Unmarshal(jsonBytes, &m) == nil {
+		return shared.FunctionParameters(m)
+	}
+
+	return nil
+}
+
+// convertSchema recursively converts a genai.Schema to OpenAI JSON schema format.
 func convertSchema(schema *genai.Schema) (map[string]any, error) {
 	if schema == nil {
-		return map[string]any{
-			"type":       "object",
-			"properties": map[string]any{},
-		}, nil
+		return map[string]any{"type": "object", "properties": map[string]any{}}, nil
 	}
 
 	result := make(map[string]any)
 
 	if schema.Type != genai.TypeUnspecified {
-		result["type"] = convertSchemaType(schema.Type)
+		result["type"] = schemaTypeToString(schema.Type)
 	}
-
 	if schema.Description != "" {
 		result["description"] = schema.Description
 	}
+	if len(schema.Required) > 0 {
+		result["required"] = schema.Required
+	}
+	if len(schema.Enum) > 0 {
+		result["enum"] = schema.Enum
+	}
 
 	if len(schema.Properties) > 0 {
-		properties := make(map[string]any)
-		for propName, propSchema := range schema.Properties {
-			convertedProp, err := convertSchema(propSchema)
+		props := make(map[string]any)
+		for name, propSchema := range schema.Properties {
+			converted, err := convertSchema(propSchema)
 			if err != nil {
 				return nil, err
 			}
-			properties[propName] = convertedProp
+			props[name] = converted
 		}
-		result["properties"] = properties
-	}
-
-	if len(schema.Required) > 0 {
-		result["required"] = schema.Required
+		result["properties"] = props
 	}
 
 	if schema.Items != nil {
@@ -532,53 +542,85 @@ func convertSchema(schema *genai.Schema) (map[string]any, error) {
 		result["items"] = items
 	}
 
-	if len(schema.Enum) > 0 {
-		result["enum"] = schema.Enum
-	}
-
 	return result, nil
 }
 
-func convertSchemaType(t genai.Type) string {
-	switch t {
-	case genai.TypeString:
-		return "string"
-	case genai.TypeNumber:
-		return "number"
-	case genai.TypeInteger:
-		return "integer"
-	case genai.TypeBoolean:
-		return "boolean"
-	case genai.TypeArray:
-		return "array"
-	case genai.TypeObject:
-		return "object"
-	default:
-		return "string"
+// normalizeToolCallID shortens IDs exceeding OpenAI's 40-char limit using a hash.
+// The mapping is stored to allow reverse lookup if needed.
+func (m *Model) normalizeToolCallID(id string) string {
+	if len(id) <= maxToolCallIDLength {
+		return id
+	}
+
+	hash := sha256.Sum256([]byte(id))
+	shortID := "tc_" + hex.EncodeToString(hash[:])[:maxToolCallIDLength-3]
+
+	m.toolCallIDMapMu.Lock()
+	m.toolCallIDMap[shortID] = id
+	m.toolCallIDMapMu.Unlock()
+
+	return shortID
+}
+
+// denormalizeToolCallID restores the original ID from a shortened one.
+func (m *Model) denormalizeToolCallID(shortID string) string {
+	m.toolCallIDMapMu.RLock()
+	defer m.toolCallIDMapMu.RUnlock()
+
+	if original, exists := m.toolCallIDMap[shortID]; exists {
+		return original
+	}
+	return shortID
+}
+
+// --- Helper functions ---
+
+// convertInlineDataToImage converts inline image data to OpenAI format.
+func convertInlineDataToImage(data *genai.Blob) *openai.ChatCompletionContentPartImageParam {
+	supportedTypes := map[string]bool{
+		"image/jpg": true, "image/jpeg": true, "image/png": true,
+		"image/gif": true, "image/webp": true,
+	}
+
+	if !supportedTypes[data.MIMEType] {
+		return nil
+	}
+
+	return &openai.ChatCompletionContentPartImageParam{
+		ImageURL: openai.ChatCompletionContentPartImageImageURLParam{
+			URL:    fmt.Sprintf("data:%s;base64,%s", data.MIMEType, base64.StdEncoding.EncodeToString(data.Data)),
+			Detail: "auto",
+		},
 	}
 }
 
-func convertRoleToOpenAI(role string) string {
-	switch role {
-	case "user":
-		return "user"
-	case "model":
+// convertUsageMetadata converts OpenAI usage stats to genai format.
+func convertUsageMetadata(usage openai.CompletionUsage) *genai.GenerateContentResponseUsageMetadata {
+	if usage.TotalTokens == 0 {
+		return nil
+	}
+	return &genai.GenerateContentResponseUsageMetadata{
+		PromptTokenCount:     int32(usage.PromptTokens),
+		CandidatesTokenCount: int32(usage.CompletionTokens),
+		TotalTokenCount:      int32(usage.TotalTokens),
+	}
+}
+
+// convertRole maps genai roles to OpenAI roles.
+func convertRole(role string) string {
+	if role == "model" {
 		return "assistant"
-	case "system":
-		return "system"
-	default:
-		return "user"
 	}
+	return role // "user" and "system" are the same
 }
 
+// convertFinishReason maps OpenAI finish reasons to genai format.
 func convertFinishReason(reason string) genai.FinishReason {
 	switch reason {
-	case "stop":
+	case "stop", "tool_calls", "function_call":
 		return genai.FinishReasonStop
 	case "length":
 		return genai.FinishReasonMaxTokens
-	case "tool_calls", "function_call":
-		return genai.FinishReasonStop
 	case "content_filter":
 		return genai.FinishReasonSafety
 	default:
@@ -586,7 +628,36 @@ func convertFinishReason(reason string) genai.FinishReason {
 	}
 }
 
-func extractTextFromContent(content *genai.Content) string {
+// convertThinkingLevel maps genai thinking levels to OpenAI reasoning effort.
+func convertThinkingLevel(level genai.ThinkingLevel) shared.ReasoningEffort {
+	switch level {
+	case genai.ThinkingLevelLow:
+		return shared.ReasoningEffortLow
+	case genai.ThinkingLevelHigh:
+		return shared.ReasoningEffortHigh
+	default:
+		return shared.ReasoningEffortMedium
+	}
+}
+
+// schemaTypeToString converts genai.Type to JSON schema type string.
+func schemaTypeToString(t genai.Type) string {
+	types := map[genai.Type]string{
+		genai.TypeString:  "string",
+		genai.TypeNumber:  "number",
+		genai.TypeInteger: "integer",
+		genai.TypeBoolean: "boolean",
+		genai.TypeArray:   "array",
+		genai.TypeObject:  "object",
+	}
+	if s, ok := types[t]; ok {
+		return s
+	}
+	return "string"
+}
+
+// extractText extracts all text parts from a Content and joins them.
+func extractText(content *genai.Content) string {
 	if content == nil {
 		return ""
 	}
@@ -599,23 +670,12 @@ func extractTextFromContent(content *genai.Content) string {
 	return joinTexts(texts)
 }
 
+// joinTexts joins multiple text strings with newlines.
 func joinTexts(texts []string) string {
-	if len(texts) == 0 {
-		return ""
-	}
-	if len(texts) == 1 {
-		return texts[0]
-	}
-	result := ""
-	for i, text := range texts {
-		if i > 0 {
-			result += "\n"
-		}
-		result += text
-	}
-	return result
+	return strings.Join(texts, "\n")
 }
 
+// parseJSONArgs parses a JSON string into a map. Returns empty map on error.
 func parseJSONArgs(argsJSON string) map[string]any {
 	if argsJSON == "" {
 		return make(map[string]any)

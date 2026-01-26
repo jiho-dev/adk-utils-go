@@ -272,7 +272,7 @@ func (m *Model) convertContentToMessage(content *genai.Content) (*anthropic.Mess
 				OfToolUse: &anthropic.ToolUseBlockParam{
 					ID:    sanitizeToolID(part.FunctionCall.ID),
 					Name:  part.FunctionCall.Name,
-					Input: convertToolInput(part.FunctionCall.Args),
+					Input: convertToolInputToRaw(part.FunctionCall.Args),
 				},
 			})
 		}
@@ -404,22 +404,53 @@ func convertStopReason(reason anthropic.StopReason) genai.FinishReason {
 	}
 }
 
-// convertToolInput ensures tool input is a map[string]any, converting via JSON if needed.
+// emptyJSONObject is the JSON representation of an empty object.
+var emptyJSONObject = json.RawMessage(`{}`)
+
+// convertToolInputToRaw converts tool input to json.RawMessage for sending to Anthropic API.
+// Handles nil values and nil maps inside interfaces by returning "{}".
+func convertToolInputToRaw(input any) json.RawMessage {
+	if input == nil {
+		return emptyJSONObject
+	}
+
+	// If already json.RawMessage, use directly
+	if raw, ok := input.(json.RawMessage); ok && len(raw) > 0 {
+		return raw
+	}
+
+	// Marshal to JSON (handles nil maps inside interface correctly)
+	data, err := json.Marshal(input)
+	if err != nil || len(data) == 0 || string(data) == "null" {
+		return emptyJSONObject
+	}
+	return data
+}
+
+// convertToolInput converts tool input to map[string]any for storing in genai.FunctionCall.Args.
+// Used when receiving tool_use blocks from Anthropic responses.
 func convertToolInput(input any) map[string]any {
 	if input == nil {
-		return make(map[string]any)
+		return map[string]any{}
 	}
 	if m, ok := input.(map[string]any); ok {
 		return m
 	}
-	// Try to convert via JSON
-	data, err := json.Marshal(input)
-	if err != nil {
-		return make(map[string]any)
+
+	// Get JSON bytes: use directly if json.RawMessage, otherwise marshal
+	var data []byte
+	if raw, ok := input.(json.RawMessage); ok {
+		data = raw
+	} else {
+		var err error
+		if data, err = json.Marshal(input); err != nil {
+			return map[string]any{}
+		}
 	}
+
 	var result map[string]any
 	if err := json.Unmarshal(data, &result); err != nil {
-		return make(map[string]any)
+		return map[string]any{}
 	}
 	return result
 }

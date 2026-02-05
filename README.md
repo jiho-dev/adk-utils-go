@@ -1,8 +1,13 @@
+<p align="center">
+  <img src="docs/images/header.svg" alt="adk-utils-go" width="600">
+</p>
+
 # ADK Utils Go
 
 Utilities and implementations for [Google's Agent Development Kit (ADK)](https://google.github.io/adk-docs/) in Go.
 
 This repository provides production-ready implementations for:
+
 - **LLM Clients**: OpenAI and Anthropic clients compatible with ADK
 - **Session Management**: Redis-based session persistence
 - **Long-term Memory**: PostgreSQL + pgvector for semantic search
@@ -75,6 +80,7 @@ agent, _ := llmagent.New(llmagent.Config{
 ### Supported Features
 
 Both clients support:
+
 - Streaming and non-streaming responses
 - System instructions
 - Tool/function calling
@@ -146,6 +152,7 @@ agent, _ := llmagent.New(llmagent.Config{
 ```
 
 The toolset provides:
+
 - `search_memory`: Semantic search across stored memories
 - `save_to_memory`: Save information for future recall
 
@@ -153,13 +160,13 @@ The toolset provides:
 
 Complete working examples in the `examples/` directory:
 
-| Example | Description |
-|---------|-------------|
-| [openai-client](examples/openai-client) | OpenAI/Ollama client usage |
-| [anthropic-client](examples/anthropic-client) | Anthropic Claude client usage |
-| [session-memory](examples/session-memory) | Session management with Redis |
+| Example                                       | Description                                 |
+| --------------------------------------------- | ------------------------------------------- |
+| [openai-client](examples/openai-client)       | OpenAI/Ollama client usage                  |
+| [anthropic-client](examples/anthropic-client) | Anthropic Claude client usage               |
+| [session-memory](examples/session-memory)     | Session management with Redis               |
 | [long-term-memory](examples/long-term-memory) | Long-term memory with PostgreSQL + pgvector |
-| [full-memory](examples/full-memory) | Combined session + long-term memory |
+| [full-memory](examples/full-memory)           | Combined session + long-term memory         |
 
 ### Quick Start
 
@@ -176,16 +183,16 @@ go run ./examples/openai-client
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENAI_API_KEY` | - | OpenAI API key (not needed for Ollama) |
-| `OPENAI_BASE_URL` | - | OpenAI-compatible API endpoint |
-| `ANTHROPIC_API_KEY` | - | Anthropic API key |
-| `MODEL_NAME` | `gpt-4o` / `claude-sonnet-4-5-20250929` | Model name |
-| `EMBEDDING_BASE_URL` | `http://localhost:11434/v1` | Embedding API endpoint |
-| `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model |
-| `POSTGRES_URL` | `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable` | PostgreSQL connection |
-| `REDIS_ADDR` | `localhost:6379` | Redis address |
+| Variable             | Default                                                                | Description                            |
+| -------------------- | ---------------------------------------------------------------------- | -------------------------------------- |
+| `OPENAI_API_KEY`     | -                                                                      | OpenAI API key (not needed for Ollama) |
+| `OPENAI_BASE_URL`    | -                                                                      | OpenAI-compatible API endpoint         |
+| `ANTHROPIC_API_KEY`  | -                                                                      | Anthropic API key                      |
+| `MODEL_NAME`         | `gpt-4o` / `claude-sonnet-4-5-20250929`                                | Model name                             |
+| `EMBEDDING_BASE_URL` | `http://localhost:11434/v1`                                            | Embedding API endpoint                 |
+| `EMBEDDING_MODEL`    | `nomic-embed-text`                                                     | Embedding model                        |
+| `POSTGRES_URL`       | `postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable` | PostgreSQL connection                  |
+| `REDIS_ADDR`         | `localhost:6379`                                                       | Redis address                          |
 
 ## Requirements
 

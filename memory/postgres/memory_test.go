@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/achetronic/adk-utils-go/memory/memorytypes"
 	"google.golang.org/adk/memory"
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/session"
@@ -386,6 +387,425 @@ func TestSearchIsolationByApp(t *testing.T) {
 	}
 
 	t.Logf("✓ SearchIsolationByApp: app isolation works correctly")
+}
+
+func TestSearchWithID(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-withid", "test_app", "user-withid", []struct{ author, text string }{
+		{"user", "I love programming in Go"},
+		{"assistant", "Go is a great language for building scalable systems"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-withid",
+		Query:   "Go programming",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID failed: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatal("Expected to find memories with SearchWithID")
+	}
+
+	for _, entry := range results {
+		if entry.ID == 0 {
+			t.Error("Expected non-zero ID in SearchWithID results")
+		}
+		if entry.Content == nil || len(entry.Content.Parts) == 0 {
+			t.Error("Expected content in SearchWithID results")
+		}
+	}
+
+	t.Logf("✓ SearchWithID: found %d entries with IDs", len(results))
+}
+
+func TestSearchWithIDRecent(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-withid-recent", "test_app", "user-withid-recent", []struct{ author, text string }{
+		{"user", "Remember this fact"},
+		{"assistant", "I will remember it"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-withid-recent",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID with empty query failed: %v", err)
+	}
+
+	if len(results) == 0 {
+		t.Fatal("Expected recent entries with empty query")
+	}
+
+	for _, entry := range results {
+		if entry.ID == 0 {
+			t.Error("Expected non-zero ID in recent results")
+		}
+	}
+
+	t.Logf("✓ SearchWithIDRecent: found %d recent entries with IDs", len(results))
+}
+
+func TestUpdateMemory(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-update", "test_app", "user-update", []struct{ author, text string }{
+		{"assistant", "The user likes cats"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-update",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Expected at least one entry to update")
+	}
+
+	entryID := results[0].ID
+
+	err = svc.UpdateMemory(ctx, "test_app", "user-update", entryID, "The user likes dogs now")
+	if err != nil {
+		t.Fatalf("UpdateMemory failed: %v", err)
+	}
+
+	var contentText string
+	err = svc.DB().QueryRowContext(ctx, "SELECT content_text FROM memory_entries WHERE id = $1", entryID).Scan(&contentText)
+	if err != nil {
+		t.Fatalf("Failed to query updated entry: %v", err)
+	}
+	if contentText != "The user likes dogs now" {
+		t.Errorf("Expected updated content, got: %s", contentText)
+	}
+
+	t.Logf("✓ UpdateMemory: entry %d updated successfully", entryID)
+}
+
+func TestUpdateMemoryNotFound(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	err := svc.UpdateMemory(ctx, "test_app", "user-nonexistent", 999999, "new content")
+	if err == nil {
+		t.Fatal("Expected error when updating non-existent entry")
+	}
+	if !contains(err.Error(), "not found") {
+		t.Errorf("Expected 'not found' error, got: %v", err)
+	}
+
+	t.Logf("✓ UpdateMemoryNotFound: correctly returned error")
+}
+
+func TestUpdateMemoryEmptyContent(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	err := svc.UpdateMemory(ctx, "test_app", "user-1", 1, "")
+	if err == nil {
+		t.Fatal("Expected error when updating with empty content")
+	}
+
+	t.Logf("✓ UpdateMemoryEmptyContent: correctly returned error")
+}
+
+func TestUpdateMemoryIsolation(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-update-iso", "test_app", "user-update-iso", []struct{ author, text string }{
+		{"assistant", "Private data for user-update-iso"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-update-iso",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Expected at least one entry")
+	}
+
+	entryID := results[0].ID
+
+	err = svc.UpdateMemory(ctx, "test_app", "attacker-user", entryID, "hacked")
+	if err == nil {
+		t.Fatal("Expected error when updating another user's entry")
+	}
+
+	err = svc.UpdateMemory(ctx, "other_app", "user-update-iso", entryID, "hacked")
+	if err == nil {
+		t.Fatal("Expected error when updating entry from different app")
+	}
+
+	t.Logf("✓ UpdateMemoryIsolation: user/app scoping works correctly")
+}
+
+func TestDeleteMemory(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-delete", "test_app", "user-delete", []struct{ author, text string }{
+		{"assistant", "Temporary information to delete"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-delete",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Expected at least one entry to delete")
+	}
+
+	entryID := results[0].ID
+
+	err = svc.DeleteMemory(ctx, "test_app", "user-delete", entryID)
+	if err != nil {
+		t.Fatalf("DeleteMemory failed: %v", err)
+	}
+
+	var count int
+	err = svc.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM memory_entries WHERE id = $1", entryID).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to count entries: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("Expected entry to be deleted, but found %d", count)
+	}
+
+	t.Logf("✓ DeleteMemory: entry %d deleted successfully", entryID)
+}
+
+func TestDeleteMemoryNotFound(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	err := svc.DeleteMemory(ctx, "test_app", "user-nonexistent", 999999)
+	if err == nil {
+		t.Fatal("Expected error when deleting non-existent entry")
+	}
+	if !contains(err.Error(), "not found") {
+		t.Errorf("Expected 'not found' error, got: %v", err)
+	}
+
+	t.Logf("✓ DeleteMemoryNotFound: correctly returned error")
+}
+
+func TestDeleteMemoryIsolation(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-delete-iso", "test_app", "user-delete-iso", []struct{ author, text string }{
+		{"assistant", "Private data for user-delete-iso"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-delete-iso",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Expected at least one entry")
+	}
+
+	entryID := results[0].ID
+
+	err = svc.DeleteMemory(ctx, "test_app", "attacker-user", entryID)
+	if err == nil {
+		t.Fatal("Expected error when deleting another user's entry")
+	}
+
+	err = svc.DeleteMemory(ctx, "other_app", "user-delete-iso", entryID)
+	if err == nil {
+		t.Fatal("Expected error when deleting entry from different app")
+	}
+
+	var count int
+	err = svc.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM memory_entries WHERE id = $1", entryID).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to count entries: %v", err)
+	}
+	if count != 1 {
+		t.Error("Entry should still exist after failed cross-user/cross-app delete attempts")
+	}
+
+	t.Logf("✓ DeleteMemoryIsolation: user/app scoping works correctly")
+}
+
+func TestDeleteThenSearch(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-del-search", "test_app", "user-del-search", []struct{ author, text string }{
+		{"assistant", "The user favorite color is blue"},
+		{"assistant", "The user works at Acme Corp"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-del-search",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("Expected 2 entries, got %d", len(results))
+	}
+
+	err = svc.DeleteMemory(ctx, "test_app", "user-del-search", results[0].ID)
+	if err != nil {
+		t.Fatalf("DeleteMemory failed: %v", err)
+	}
+
+	remaining, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-del-search",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID after delete failed: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Errorf("Expected 1 remaining entry, got %d", len(remaining))
+	}
+
+	t.Logf("✓ DeleteThenSearch: correctly shows %d remaining entry after deletion", len(remaining))
+}
+
+func TestUpdateThenSearch(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+	ctx := context.Background()
+
+	sess := createTestSession("sess-upd-search", "test_app", "user-upd-search", []struct{ author, text string }{
+		{"assistant", "The user prefers dark mode"},
+	})
+
+	err := svc.AddSession(ctx, sess)
+	if err != nil {
+		t.Fatalf("AddSession failed: %v", err)
+	}
+
+	results, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-upd-search",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Expected at least one entry")
+	}
+
+	entryID := results[0].ID
+
+	err = svc.UpdateMemory(ctx, "test_app", "user-upd-search", entryID, "The user prefers light mode")
+	if err != nil {
+		t.Fatalf("UpdateMemory failed: %v", err)
+	}
+
+	updated, err := svc.SearchWithID(ctx, &memory.SearchRequest{
+		AppName: "test_app",
+		UserID:  "user-upd-search",
+		Query:   "",
+	})
+	if err != nil {
+		t.Fatalf("SearchWithID after update failed: %v", err)
+	}
+	if len(updated) == 0 {
+		t.Fatal("Expected to find updated entry")
+	}
+
+	foundUpdated := false
+	for _, entry := range updated {
+		if entry.Content != nil && len(entry.Content.Parts) > 0 {
+			if entry.Content.Parts[0].Text == "The user prefers light mode" {
+				foundUpdated = true
+			}
+		}
+	}
+	if !foundUpdated {
+		t.Error("Expected to find updated content in search results")
+	}
+
+	t.Logf("✓ UpdateThenSearch: updated content found in search results")
+}
+
+func TestExtendedMemoryServiceInterface(t *testing.T) {
+	svc := setupTestDB(t)
+	defer svc.Close()
+
+	var _ memorytypes.ExtendedMemoryService = svc
+
+	t.Logf("✓ ExtendedMemoryServiceInterface: PostgresMemoryService satisfies the interface")
 }
 
 func TestClose(t *testing.T) {

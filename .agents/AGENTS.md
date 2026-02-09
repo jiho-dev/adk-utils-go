@@ -6,8 +6,9 @@ Agent guidelines for working in the `adk-utils-go` repository.
 
 A Go library providing utilities for Google's Agent Development Kit (ADK). This library extends ADK with additional backend implementations for topics like session management or memory services.
 
-**Module**: `adk` (see `go.mod`)  
-**Go Version**: 1.24.9+
+**Module**: `github.com/achetronic/adk-utils-go` (see `go.mod`)  
+**Go Version**: 1.24.9+  
+**ADK Version**: v0.4.0
 
 ### Key Dependencies
 
@@ -60,16 +61,18 @@ go mod verify
 adk-utils-go/
 ├── session/
 │   └── redis/
-│       └── session.go      # Redis-backed session.Service implementation
+│       └── session.go        # Redis-backed session.Service implementation
 ├── memory/
+│   ├── memorytypes/
+│   │   └── types.go          # Shared types and interfaces (EntryWithID, ExtendedMemoryService)
 │   └── postgres/
-│       ├── memory.go       # PostgreSQL-backed memory.Service implementation
-│       ├── memory_test.go  # Memory service tests (requires PostgreSQL)
-│       ├── embedding.go    # OpenAI-compatible embedding model
+│       ├── memory.go         # PostgreSQL-backed memory.Service implementation
+│       ├── memory_test.go    # Memory service tests (requires PostgreSQL)
+│       ├── embedding.go      # OpenAI-compatible embedding model
 │       └── embedding_test.go # Embedding tests (uses httptest mocks)
 ├── tools/
 │   └── memory/
-│       └── toolset.go      # Memory toolset for agent tools
+│       └── toolset.go        # Memory toolset for agent tools
 ├── go.mod
 └── go.sum
 ```
@@ -79,8 +82,9 @@ adk-utils-go/
 | Package | Description |
 |---------|-------------|
 | `session/redis` | Redis-backed implementation of `session.Service` |
-| `memory/postgres` | PostgreSQL+pgvector implementation of `memory.Service` |
-| `tools/memory` | ADK toolset providing `search_memory` and `save_to_memory` tools |
+| `memory/memorytypes` | Shared types (`EntryWithID`) and interfaces (`MemoryService`, `ExtendedMemoryService`) |
+| `memory/postgres` | PostgreSQL+pgvector implementation of `memory.Service` and `ExtendedMemoryService` |
+| `tools/memory` | ADK toolset providing `search_memory`, `save_to_memory`, `update_memory`, and `delete_memory` tools |
 
 ---
 
@@ -177,9 +181,12 @@ The `OpenAICompatibleEmbedding` implementation works with any OpenAI-compatible 
 
 ### Memory Toolset
 
-1. **Tool Names**: `search_memory` and `save_to_memory`
-2. **User Scoping**: Tools automatically use `ctx.UserID()` for isolation.
-3. **Single Entry Session**: `save_to_memory` creates a minimal session wrapper around the content.
+1. **Tool Names**: `search_memory`, `save_to_memory`, `update_memory`, and `delete_memory`
+2. **Extended Tools**: `update_memory` and `delete_memory` are only available when the `MemoryService` also implements `memorytypes.ExtendedMemoryService` (e.g., `PostgresMemoryService`).
+3. **ID-Aware Search**: When extended service is available, `search_memory` returns entry IDs that can be used with `update_memory` and `delete_memory`.
+4. **User Scoping**: Tools automatically use `ctx.UserID()` for isolation.
+5. **DisableExtendedTools**: `ToolsetConfig.DisableExtendedTools` allows disabling `update_memory` and `delete_memory` even when the backend supports them.
+6. **Single Entry Session**: `save_to_memory` creates a minimal session wrapper around the content.
 
 ### Go 1.24 Iterator Pattern
 
@@ -204,11 +211,22 @@ func (e *Events) All() iter.Seq[*session.Event]
 3. Implement `session.Session`, `session.State`, `session.Events` interfaces
 4. Add interface compliance check: `var _ session.Service = (*YourService)(nil)`
 
+### Shared Types (`memory/memorytypes`)
+
+To avoid import cycles between `memory/postgres` and `tools/memory`, shared types and interfaces live in `memory/memorytypes`:
+
+- `EntryWithID` — memory entry with database row ID
+- `MemoryService` — base interface (mirrors ADK's `memory.Service`)
+- `ExtendedMemoryService` — adds `SearchWithID`, `UpdateMemory`, `DeleteMemory`
+
+Both `memory/postgres` and `tools/memory` import this package; neither imports the other.
+
 ### New Memory Backend
 
 1. Create package under `memory/{backend}/`
 2. Implement `memory.Service` interface (`AddSession`, `Search`)
-3. Consider supporting the `EmbeddingModel` interface for semantic search
+3. Optionally implement `memorytypes.ExtendedMemoryService` (`SearchWithID`, `UpdateMemory`, `DeleteMemory`) to enable update/delete tools
+4. Consider supporting the `EmbeddingModel` interface for semantic search
 
 ### New Toolset
 

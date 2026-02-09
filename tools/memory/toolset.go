@@ -15,11 +15,11 @@
 package memory
 
 import (
-	"context"
 	"fmt"
 	"iter"
 	"time"
 
+	"github.com/achetronic/adk-utils-go/memory/memorytypes"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/memory"
 	"google.golang.org/adk/model"
@@ -29,26 +29,24 @@ import (
 	"google.golang.org/genai"
 )
 
-// MemoryService defines the interface for a memory backend.
-// This matches google.golang.org/adk/memory.Service
-type MemoryService interface {
-	AddSession(ctx context.Context, s session.Session) error
-	Search(ctx context.Context, req *memory.SearchRequest) (*memory.SearchResponse, error)
-}
-
 // Toolset provides tools for the agent to interact with long-term memory.
 type Toolset struct {
-	memoryService MemoryService
-	appName       string
-	tools         []tool.Tool
+	memoryService    memorytypes.MemoryService
+	extMemoryService memorytypes.ExtendedMemoryService
+	appName          string
+	tools            []tool.Tool
 }
 
 // ToolsetConfig holds configuration for the memory toolset.
 type ToolsetConfig struct {
-	// MemoryService is the memory service to use (can be any implementation)
-	MemoryService MemoryService
+	// MemoryService is the memory service to use (can be any implementation).
+	// If it also implements memorytypes.ExtendedMemoryService, update and delete tools will be available.
+	MemoryService memorytypes.MemoryService
 	// AppName is used to scope memory operations
 	AppName string
+	// DisableExtendedTools prevents registration of update_memory and delete_memory
+	// even when the MemoryService supports them.
+	DisableExtendedTools bool
 }
 
 // NewToolset creates a new toolset for memory operations.
@@ -65,11 +63,16 @@ func NewToolset(cfg ToolsetConfig) (*Toolset, error) {
 		appName:       cfg.AppName,
 	}
 
-	// Create search tool
+	if !cfg.DisableExtendedTools {
+		if ext, ok := cfg.MemoryService.(memorytypes.ExtendedMemoryService); ok {
+			ts.extMemoryService = ext
+		}
+	}
+
 	searchTool, err := functiontool.New(
 		functiontool.Config{
 			Name:        "search_memory",
-			Description: "Search long-term memory for relevant information from past conversations. Use this to recall facts, preferences, or context from previous interactions with the user.",
+			Description: "Search long-term memory for relevant information from past conversations. Use this to recall facts, preferences, or context from previous interactions with the user. Results include an 'id' field that can be used with update_memory and delete_memory.",
 		},
 		ts.searchMemory,
 	)
@@ -77,7 +80,6 @@ func NewToolset(cfg ToolsetConfig) (*Toolset, error) {
 		return nil, fmt.Errorf("failed to create search_memory tool: %w", err)
 	}
 
-	// Create save tool
 	saveTool, err := functiontool.New(
 		functiontool.Config{
 			Name:        "save_to_memory",
@@ -90,6 +92,32 @@ func NewToolset(cfg ToolsetConfig) (*Toolset, error) {
 	}
 
 	ts.tools = []tool.Tool{searchTool, saveTool}
+
+	if ts.extMemoryService != nil {
+		updateTool, err := functiontool.New(
+			functiontool.Config{
+				Name:        "update_memory",
+				Description: "Update the content of an existing memory entry. Use this to correct outdated information or refine a previously saved memory. Requires the memory entry ID from search_memory results.",
+			},
+			ts.updateMemory,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create update_memory tool: %w", err)
+		}
+
+		deleteTool, err := functiontool.New(
+			functiontool.Config{
+				Name:        "delete_memory",
+				Description: "Delete a memory entry permanently. Use this to remove incorrect, irrelevant, or outdated information from long-term memory. Requires the memory entry ID from search_memory results.",
+			},
+			ts.deleteMemory,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create delete_memory tool: %w", err)
+		}
+
+		ts.tools = append(ts.tools, updateTool, deleteTool)
+	}
 
 	return ts, nil
 }
@@ -106,25 +134,20 @@ func (ts *Toolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 
 // SearchArgs are the arguments for the search_memory tool.
 type SearchArgs struct {
-	// Query is the search query to find relevant memories
 	Query string `json:"query"`
 }
 
 // SearchResult is the result of the search_memory tool.
 type SearchResult struct {
-	// Memories contains the found memories
 	Memories []Entry `json:"memories"`
-	// Count is the number of memories found
-	Count int `json:"count"`
+	Count    int     `json:"count"`
 }
 
 // Entry represents a single memory entry returned by search.
 type Entry struct {
-	// Text is the content of the memory
-	Text string `json:"text"`
-	// Author is who created this memory (user or agent)
-	Author string `json:"author"`
-	// Timestamp is when this memory was created
+	ID        int    `json:"id"`
+	Text      string `json:"text"`
+	Author    string `json:"author"`
 	Timestamp string `json:"timestamp"`
 }
 
@@ -135,12 +158,39 @@ func (ts *Toolset) searchMemory(ctx tool.Context, args SearchArgs) (SearchResult
 	}
 
 	userID := ctx.UserID()
-
-	resp, err := ts.memoryService.Search(ctx, &memory.SearchRequest{
+	req := &memory.SearchRequest{
 		AppName: ts.appName,
 		UserID:  userID,
 		Query:   args.Query,
-	})
+	}
+
+	if ts.extMemoryService != nil {
+		results, err := ts.extMemoryService.SearchWithID(ctx, req)
+		if err != nil {
+			return SearchResult{}, fmt.Errorf("failed to search memory: %w", err)
+		}
+
+		var entries []Entry
+		for _, mem := range results {
+			text := ""
+			if mem.Content != nil && len(mem.Content.Parts) > 0 {
+				text = mem.Content.Parts[0].Text
+			}
+			entries = append(entries, Entry{
+				ID:        mem.ID,
+				Text:      text,
+				Author:    mem.Author,
+				Timestamp: mem.Timestamp.Format("2006-01-02 15:04:05"),
+			})
+		}
+
+		return SearchResult{
+			Memories: entries,
+			Count:    len(entries),
+		}, nil
+	}
+
+	resp, err := ts.memoryService.Search(ctx, req)
 	if err != nil {
 		return SearchResult{}, fmt.Errorf("failed to search memory: %w", err)
 	}
@@ -166,17 +216,13 @@ func (ts *Toolset) searchMemory(ctx tool.Context, args SearchArgs) (SearchResult
 
 // SaveArgs are the arguments for the save_to_memory tool.
 type SaveArgs struct {
-	// Content is the information to save to memory
-	Content string `json:"content"`
-	// Category is an optional category for the memory (e.g., 'preference', 'fact', 'reminder')
+	Content  string `json:"content"`
 	Category string `json:"category,omitempty"`
 }
 
 // SaveResult is the result of the save_to_memory tool.
 type SaveResult struct {
-	// Success indicates if the save was successful
-	Success bool `json:"success"`
-	// Message provides additional information
+	Success bool   `json:"success"`
 	Message string `json:"message"`
 }
 
@@ -191,7 +237,6 @@ func (ts *Toolset) saveToMemory(ctx tool.Context, args SaveArgs) (SaveResult, er
 
 	userID := ctx.UserID()
 
-	// Create a minimal session with just this memory entry
 	memorySession := &singleEntrySession{
 		id:       fmt.Sprintf("memory-%d", time.Now().UnixNano()),
 		appName:  ts.appName,
@@ -211,6 +256,81 @@ func (ts *Toolset) saveToMemory(ctx tool.Context, args SaveArgs) (SaveResult, er
 	return SaveResult{
 		Success: true,
 		Message: "Memory saved successfully",
+	}, nil
+}
+
+// UpdateArgs are the arguments for the update_memory tool.
+type UpdateArgs struct {
+	ID      int    `json:"id"`
+	Content string `json:"content"`
+}
+
+// UpdateResult is the result of the update_memory tool.
+type UpdateResult struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// updateMemory updates an existing memory entry.
+func (ts *Toolset) updateMemory(ctx tool.Context, args UpdateArgs) (UpdateResult, error) {
+	if args.ID == 0 {
+		return UpdateResult{
+			Success: false,
+			Message: "id is required",
+		}, nil
+	}
+	if args.Content == "" {
+		return UpdateResult{
+			Success: false,
+			Message: "content cannot be empty",
+		}, nil
+	}
+
+	err := ts.extMemoryService.UpdateMemory(ctx, ts.appName, ctx.UserID(), args.ID, args.Content)
+	if err != nil {
+		return UpdateResult{
+			Success: false,
+			Message: fmt.Sprintf("failed to update: %v", err),
+		}, nil
+	}
+
+	return UpdateResult{
+		Success: true,
+		Message: "Memory updated successfully",
+	}, nil
+}
+
+// DeleteArgs are the arguments for the delete_memory tool.
+type DeleteArgs struct {
+	ID int `json:"id"`
+}
+
+// DeleteResult is the result of the delete_memory tool.
+type DeleteResult struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+// deleteMemory deletes a memory entry.
+func (ts *Toolset) deleteMemory(ctx tool.Context, args DeleteArgs) (DeleteResult, error) {
+	if args.ID == 0 {
+		return DeleteResult{
+			Success: false,
+			Message: "id is required",
+		}, nil
+	}
+
+	err := ts.extMemoryService.DeleteMemory(ctx, ts.appName, ctx.UserID(), args.ID)
+	if err != nil {
+		return DeleteResult{
+			Success: false,
+			Message: fmt.Sprintf("failed to delete: %v", err),
+		}, nil
+	}
+
+	return DeleteResult{
+		Success: true,
+		Message: "Memory deleted successfully",
 	}, nil
 }
 

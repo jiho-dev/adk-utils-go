@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/achetronic/adk-utils-go/memory/memorytypes"
 	_ "github.com/lib/pq"
 	"google.golang.org/adk/memory"
 	"google.golang.org/adk/session"
@@ -292,6 +293,132 @@ func (s *PostgresMemoryService) Search(ctx context.Context, req *memory.SearchRe
 	return &memory.SearchResponse{Memories: memories}, nil
 }
 
+// SearchWithID finds relevant memory entries including their database IDs.
+func (s *PostgresMemoryService) SearchWithID(ctx context.Context, req *memory.SearchRequest) ([]memorytypes.EntryWithID, error) {
+	var memories []memorytypes.EntryWithID
+	var err error
+
+	if s.embeddingModel != nil && req.Query != "" {
+		embedding, embErr := s.embeddingModel.Embed(ctx, req.Query)
+		if embErr == nil && len(embedding) > 0 {
+			memories, err = s.searchByVectorWithID(ctx, req, embedding)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if len(memories) == 0 && req.Query != "" {
+		memories, err = s.searchByTextWithID(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(memories) == 0 {
+		memories, err = s.searchRecentWithID(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return memories, nil
+}
+
+// searchByVectorWithID performs semantic similarity search returning IDs.
+func (s *PostgresMemoryService) searchByVectorWithID(ctx context.Context, req *memory.SearchRequest, embedding []float32) ([]memorytypes.EntryWithID, error) {
+	query := `
+		SELECT id, content, author, timestamp
+		FROM memory_entries
+		WHERE app_name = $1 AND user_id = $2 AND embedding IS NOT NULL
+		ORDER BY embedding <=> $3
+		LIMIT 10
+	`
+
+	embeddingStr := vectorToString(embedding)
+	rows, err := s.db.QueryContext(ctx, query, req.AppName, req.UserID, embeddingStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search by vector: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanMemoriesWithID(rows)
+}
+
+// searchByTextWithID performs full-text search returning IDs.
+func (s *PostgresMemoryService) searchByTextWithID(ctx context.Context, req *memory.SearchRequest) ([]memorytypes.EntryWithID, error) {
+	query := `
+		SELECT id, content, author, timestamp
+		FROM memory_entries
+		WHERE app_name = $1 AND user_id = $2
+		AND to_tsvector('english', content_text) @@ plainto_tsquery('english', $3)
+		ORDER BY ts_rank(to_tsvector('english', content_text), plainto_tsquery('english', $3)) DESC,
+		         timestamp DESC
+		LIMIT 10
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, req.AppName, req.UserID, req.Query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search by text: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanMemoriesWithID(rows)
+}
+
+// searchRecentWithID returns the most recent memory entries with IDs.
+func (s *PostgresMemoryService) searchRecentWithID(ctx context.Context, req *memory.SearchRequest) ([]memorytypes.EntryWithID, error) {
+	query := `
+		SELECT id, content, author, timestamp
+		FROM memory_entries
+		WHERE app_name = $1 AND user_id = $2
+		ORDER BY timestamp DESC
+		LIMIT 10
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, req.AppName, req.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search recent: %w", err)
+	}
+	defer rows.Close()
+
+	return s.scanMemoriesWithID(rows)
+}
+
+// scanMemoriesWithID converts database rows to memory entries with IDs.
+func (s *PostgresMemoryService) scanMemoriesWithID(rows *sql.Rows) ([]memorytypes.EntryWithID, error) {
+	var memories []memorytypes.EntryWithID
+
+	for rows.Next() {
+		var id int
+		var contentJSON []byte
+		var author sql.NullString
+		var timestamp time.Time
+
+		if err := rows.Scan(&id, &contentJSON, &author, &timestamp); err != nil {
+			continue
+		}
+
+		var content genai.Content
+		if err := json.Unmarshal(contentJSON, &content); err != nil {
+			continue
+		}
+
+		entry := memorytypes.EntryWithID{
+			ID:        id,
+			Content:   &content,
+			Timestamp: timestamp,
+		}
+		if author.Valid {
+			entry.Author = author.String
+		}
+
+		memories = append(memories, entry)
+	}
+
+	return memories, rows.Err()
+}
+
 // searchByVector performs semantic similarity search.
 func (s *PostgresMemoryService) searchByVector(ctx context.Context, req *memory.SearchRequest, embedding []float32) ([]memory.Entry, error) {
 	query := `
@@ -384,6 +511,75 @@ func (s *PostgresMemoryService) scanMemories(rows *sql.Rows) ([]memory.Entry, er
 	return memories, rows.Err()
 }
 
+// UpdateMemory updates the content of a memory entry by ID, scoped to app and user.
+func (s *PostgresMemoryService) UpdateMemory(ctx context.Context, appName, userID string, entryID int, newContent string) error {
+	if newContent == "" {
+		return fmt.Errorf("content cannot be empty")
+	}
+
+	content := &genai.Content{
+		Parts: []*genai.Part{{Text: newContent}},
+		Role:  "assistant",
+	}
+	contentJSON, err := json.Marshal(content)
+	if err != nil {
+		return fmt.Errorf("failed to marshal content: %w", err)
+	}
+
+	var result sql.Result
+	if s.embeddingModel != nil {
+		var embeddingStr *string
+		embedding, embErr := s.embeddingModel.Embed(ctx, newContent)
+		if embErr == nil && len(embedding) > 0 {
+			embStr := vectorToString(embedding)
+			embeddingStr = &embStr
+		}
+		result, err = s.db.ExecContext(ctx,
+			`UPDATE memory_entries SET content = $1, content_text = $2, embedding = $3 WHERE id = $4 AND app_name = $5 AND user_id = $6`,
+			contentJSON, newContent, embeddingStr, entryID, appName, userID,
+		)
+	} else {
+		result, err = s.db.ExecContext(ctx,
+			`UPDATE memory_entries SET content = $1, content_text = $2 WHERE id = $3 AND app_name = $4 AND user_id = $5`,
+			contentJSON, newContent, entryID, appName, userID,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to update memory: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("memory entry not found")
+	}
+
+	return nil
+}
+
+// DeleteMemory deletes a memory entry by ID, scoped to app and user.
+func (s *PostgresMemoryService) DeleteMemory(ctx context.Context, appName, userID string, entryID int) error {
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM memory_entries WHERE id = $1 AND app_name = $2 AND user_id = $3`,
+		entryID, appName, userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to delete memory: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check rows affected: %w", err)
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("memory entry not found")
+	}
+
+	return nil
+}
+
 // Close closes the database connection.
 func (s *PostgresMemoryService) Close() error {
 	return s.db.Close()
@@ -425,5 +621,6 @@ func vectorToString(v []float32) string {
 	return sb.String()
 }
 
-// Ensure interface is implemented
+// Ensure interfaces are implemented
 var _ memory.Service = (*PostgresMemoryService)(nil)
+var _ memorytypes.ExtendedMemoryService = (*PostgresMemoryService)(nil)

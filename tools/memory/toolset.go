@@ -170,7 +170,7 @@ func (ts *Toolset) searchMemory(ctx tool.Context, args SearchArgs) (SearchResult
 			return SearchResult{}, fmt.Errorf("failed to search memory: %w", err)
 		}
 
-		var entries []Entry
+		entries := []Entry{}
 		for _, mem := range results {
 			text := ""
 			if mem.Content != nil && len(mem.Content.Parts) > 0 {
@@ -195,7 +195,7 @@ func (ts *Toolset) searchMemory(ctx tool.Context, args SearchArgs) (SearchResult
 		return SearchResult{}, fmt.Errorf("failed to search memory: %w", err)
 	}
 
-	var entries []Entry
+	entries := []Entry{}
 	for _, mem := range resp.Memories {
 		text := ""
 		if mem.Content != nil && len(mem.Content.Parts) > 0 {

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -83,7 +84,8 @@ func (s *RedisSessionService) eventsKey(appName, userID, sessionID string) strin
 	return fmt.Sprintf("events:%s:%s:%s", appName, userID, sessionID)
 }
 
-// Create creates a new session.
+// Create creates a new session. It returns an error if a session with the
+// same ID already exists, matching the canonical ADK behaviour.
 func (s *RedisSessionService) Create(ctx context.Context, req *session.CreateRequest) (*session.CreateResponse, error) {
 	sessionID := req.SessionID
 	if sessionID == "" {
@@ -92,6 +94,10 @@ func (s *RedisSessionService) Create(ctx context.Context, req *session.CreateReq
 
 	key := s.sessionKey(req.AppName, req.UserID, sessionID)
 	eventsKey := s.eventsKey(req.AppName, req.UserID, sessionID)
+
+	if exists, _ := s.client.Exists(ctx, key).Result(); exists > 0 {
+		return nil, fmt.Errorf("session %s already exists", sessionID)
+	}
 
 	sess := &redisSession{
 		id:             sessionID,
@@ -223,12 +229,21 @@ func (s *RedisSessionService) Delete(ctx context.Context, req *session.DeleteReq
 	return nil
 }
 
-// AppendEvent appends an event to a session.
+// AppendEvent appends an event to a session and applies its StateDelta to the
+// persisted session state, matching the behaviour of the official ADK in-memory
+// and database session service implementations.
 func (s *RedisSessionService) AppendEvent(ctx context.Context, sess session.Session, evt *session.Event) error {
+	if evt.Partial {
+		return nil
+	}
+
 	evt.Timestamp = time.Now()
 	if evt.ID == "" {
 		evt.ID = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
+
+	// Strip temp: keys from StateDelta before persisting the event.
+	trimTempStateDelta(evt)
 
 	data, err := json.Marshal(evt)
 	if err != nil {
@@ -241,7 +256,7 @@ func (s *RedisSessionService) AppendEvent(ctx context.Context, sess session.Sess
 	}
 	s.client.Expire(ctx, eventsKey, s.ttl)
 
-	// Update session's last update time and persist current state
+	// Load the current persisted session.
 	key := s.sessionKey(sess.AppName(), sess.UserID(), sess.ID())
 	sessData, err := s.client.Get(ctx, key).Bytes()
 	if err != nil {
@@ -253,11 +268,25 @@ func (s *RedisSessionService) AppendEvent(ctx context.Context, sess session.Sess
 		return fmt.Errorf("failed to unmarshal session: %w", err)
 	}
 
-	// Sync state from session to storable
+	// Sync the in-memory session state as a baseline.
 	state := sess.State()
 	if state != nil {
-		storable.State = make(map[string]any)
+		if storable.State == nil {
+			storable.State = make(map[string]any)
+		}
 		for k, v := range state.All() {
+			storable.State[k] = v
+		}
+	}
+
+	// Apply the event's StateDelta on top, so that state changes recorded by
+	// callbacks (BeforeModel, AfterModel, tools) are persisted even when they
+	// are not yet reflected in the in-memory session state snapshot.
+	if len(evt.Actions.StateDelta) > 0 {
+		if storable.State == nil {
+			storable.State = make(map[string]any)
+		}
+		for k, v := range evt.Actions.StateDelta {
 			storable.State[k] = v
 		}
 	}
@@ -273,6 +302,22 @@ func (s *RedisSessionService) AppendEvent(ctx context.Context, sess session.Sess
 	}
 
 	return nil
+}
+
+// trimTempStateDelta removes keys with the "temp:" prefix from the event's
+// StateDelta. These keys are meant to be ephemeral (live only for the current
+// invocation) and must not be persisted, matching the ADK's trimTempDeltaState.
+func trimTempStateDelta(evt *session.Event) {
+	if len(evt.Actions.StateDelta) == 0 {
+		return
+	}
+	filtered := make(map[string]any, len(evt.Actions.StateDelta))
+	for k, v := range evt.Actions.StateDelta {
+		if !strings.HasPrefix(k, session.KeyPrefixTemp) {
+			filtered[k] = v
+		}
+	}
+	evt.Actions.StateDelta = filtered
 }
 
 // Close closes the Redis connection.

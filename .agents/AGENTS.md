@@ -234,3 +234,33 @@ Both `memory/postgres` and `tools/memory` import this package; neither imports t
 2. Implement `tool.Toolset` interface
 3. Use `functiontool.New()` to create tools from functions
 4. Define typed args/result structs with JSON tags
+
+---
+
+## TODOs
+
+### Redis Session Service — Implement State Tiers (`app:`, `user:`, session-scoped)
+
+The official ADK defines three state key prefixes that route values to **separate stores** with different scopes:
+
+| Prefix | Scope | ADK storage |
+|--------|-------|-------------|
+| _(none)_ | Per-session | `sessions` table / per-session map |
+| `app:` | App-wide (shared across all users and sessions) | `app_states` table / `appState[appName]` |
+| `user:` | Per-user (shared across all sessions for that user) | `user_states` table / `userState[appName][userID]` |
+| `temp:` | Single invocation (never persisted) | Already handled by `trimTempStateDelta` |
+
+The constants are defined in `google.golang.org/adk/session`:
+- `KeyPrefixApp = "app:"`
+- `KeyPrefixUser = "user:"`
+- `KeyPrefixTemp = "temp:"`
+
+The ADK uses `ExtractStateDeltas` (split a flat `StateDelta` into 3 buckets by prefix, stripping the prefix) on write, and `MergeStates` (recombine the 3 stores into a single flat map, re-adding prefixes) on read. See `google.golang.org/adk/internal/sessionutils/utils.go`.
+
+**Current problem**: Our Redis implementation stores everything in a single flat map inside the session key. If an agent writes `app:theme = "dark"`, only that session sees it — other sessions for the same app do not. Same issue with `user:` keys across sessions of the same user.
+
+**What needs to change**:
+1. Add separate Redis keys for app-state (`appstate:{appName}`) and user-state (`userstate:{appName}:{userID}`)
+2. On `AppendEvent`: split `StateDelta` by prefix, strip the prefix, and write each bucket to its corresponding Redis key
+3. On `Get`: load all three stores and merge them back into a single flat map with prefixes re-added
+4. On `Create`: seed state should also be split by prefix into the appropriate stores

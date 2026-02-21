@@ -2,8 +2,6 @@ module github.com/achetronic/adk-utils-go
 
 go 1.24.9
 
-toolchain go1.24.11
-
 require (
 	github.com/anthropics/anthropic-sdk-go v1.19.0
 	github.com/lib/pq v1.10.9

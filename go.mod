@@ -5,7 +5,7 @@ go 1.24.9
 require (
 	github.com/anthropics/anthropic-sdk-go v1.19.0
 	github.com/lib/pq v1.10.9
-	github.com/openai/openai-go/v3 v3.16.0
+	github.com/openai/openai-go/v3 v3.22.0
 	github.com/redis/go-redis/v9 v9.17.2
 	google.golang.org/adk v0.4.0
 	google.golang.org/genai v1.40.0
